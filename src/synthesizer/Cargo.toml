@@ -1,0 +1,13 @@
+[package]
+name = "sherlock-synthesizer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "synth-tool"
+path = "main.rs"
+
+[dependencies]
+sherlock-graph = { path = "../graph" }
+postgres = "0.19"
+serde = { version = "1.0", features = ["derive"] }
