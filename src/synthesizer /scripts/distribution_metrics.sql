@@ -11,89 +11,7 @@
 \set ON_ERROR_STOP on
 
 -- ============================================================
--- 1) NUMERICALLY STABLE SINGLE-PASS AGGREGATE (WELFORD / PÉBAY)
--- ============================================================
-
-DROP TYPE IF EXISTS stats_state CASCADE;
-
-CREATE TYPE stats_state AS (
-    n     bigint,
-    mean  double precision,
-    m2    double precision,
-    m3    double precision,
-    m4    double precision
-);
-
-CREATE OR REPLACE FUNCTION stats_sfunc(state stats_state, x double precision)
-RETURNS stats_state AS $$
-DECLARE
-    n1 bigint;
-    delta double precision;
-    delta_n double precision;
-    delta_n2 double precision;
-    term1 double precision;
-BEGIN
-    IF state IS NULL THEN
-        RETURN (1, x, 0, 0, 0);
-    END IF;
-
-    n1 := state.n + 1;
-    delta := x - state.mean;
-    delta_n := delta / n1;
-    delta_n2 := delta_n * delta_n;
-    term1 := delta * delta_n * state.n;
-
-    RETURN (
-        n1,
-        state.mean + delta_n,
-        state.m2 + term1,
-        state.m3 + term1 * delta_n * (n1 - 2) - 3 * delta_n * state.m2,
-        state.m4 + term1 * delta_n2 * (n1*n1 - 3*n1 + 3)
-                 + 6 * delta_n2 * state.m2
-                 - 4 * delta_n * state.m3
-    );
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
-CREATE OR REPLACE FUNCTION stats_final(state stats_state)
-RETURNS jsonb AS $$
-DECLARE
-    variance double precision;
-    stddev double precision;
-    skew double precision;
-    kurt double precision;
-BEGIN
-    IF state.n < 2 THEN
-        RETURN NULL;
-    END IF;
-
-    variance := state.m2 / (state.n - 1);
-    stddev := sqrt(variance);
-
-    skew := sqrt(state.n) * state.m3 / NULLIF(power(state.m2, 1.5), 0);
-    kurt := state.n * state.m4 / NULLIF((state.m2 * state.m2), 0) - 3;
-
-    RETURN jsonb_build_object(
-        'n', state.n,
-        'mean', state.mean,
-        'variance', variance,
-        'stddev', stddev,
-        'skewness', skew,
-        'ex_kurtosis', kurt
-    );
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
-DROP AGGREGATE IF EXISTS stats_agg(double precision);
-
-CREATE AGGREGATE stats_agg(double precision) (
-    SFUNC = stats_sfunc,
-    STYPE = stats_state,
-    FINALFUNC = stats_final
-);
-
--- ============================================================
--- 2) BASE DATA EXTRACTION
+-- 1) BASE DATA EXTRACTION
 -- ============================================================
 
 WITH tx_amounts AS (
@@ -147,19 +65,34 @@ WITH tx_amounts AS (
 ),
 
 -- ============================================================
--- 3) SINGLE-PASS MOMENTS
+-- 2) MOMENTS (using standard PostgreSQL aggregates)
 -- ============================================================
 
 moments AS (
     SELECT
         tx_type,
-        stats_agg(amount) AS m
+        COUNT(*) AS n,
+        AVG(amount) AS mean,
+        STDDEV(amount) AS stddev,
+        VARIANCE(amount) AS variance,
+        -- Pearson's skewness approximation using percentiles
+        -- (P90 + P10 - 2*P50) / (P90 - P10)
+        (PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY amount) +
+         PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY amount) -
+         2 * PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY amount)) /
+        NULLIF(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY amount) -
+               PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY amount), 0) AS skewness,
+        -- Kurtosis approximation using percentiles
+        (PERCENTILE_CONT(0.975) WITHIN GROUP (ORDER BY amount) -
+         PERCENTILE_CONT(0.025) WITHIN GROUP (ORDER BY amount)) /
+        NULLIF(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount) -
+               PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount), 0) AS ex_kurtosis
     FROM tx_amounts
     GROUP BY tx_type
 ),
 
 -- ============================================================
--- 4) PERCENTILES + TAIL (SECOND PASS)
+-- 3) PERCENTILES + TAIL (SECOND PASS)
 -- ============================================================
 
 dist AS (
@@ -201,7 +134,7 @@ pareto AS (
 ),
 
 -- ============================================================
--- 5) TYPE WEIGHTS
+-- 4) TYPE WEIGHTS
 -- ============================================================
 
 type_weights AS (
@@ -213,7 +146,7 @@ type_weights AS (
 )
 
 -- ============================================================
--- 6) FINAL JSON OUTPUT
+-- 5) FINAL JSON OUTPUT
 -- ============================================================
 
 SELECT jsonb_pretty(jsonb_agg(
@@ -223,11 +156,11 @@ SELECT jsonb_pretty(jsonb_agg(
         'weight', w.weight,
 
         -- moments
-        'mean', ROUND((m.m->>'mean')::numeric, 2),
-        'variance', ROUND((m.m->>'variance')::numeric, 2),
-        'stddev', ROUND((m.m->>'stddev')::numeric, 2),
-        'skewness', ROUND((m.m->>'skewness')::numeric, 4),
-        'ex_kurtosis', ROUND((m.m->>'ex_kurtosis')::numeric, 4),
+        'mean', ROUND(m.mean::numeric, 2),
+        'variance', ROUND(m.variance::numeric, 2),
+        'stddev', ROUND(m.stddev::numeric, 2),
+        'skewness', ROUND(m.skewness::numeric, 4),
+        'ex_kurtosis', ROUND(m.ex_kurtosis::numeric, 4),
 
         -- range
         'min', d.min_amount,
