@@ -1,233 +1,291 @@
+#!/usr/bin/env python3
+"""
+Khalti Statistical DNA Extractor
+"""
+
 import os
-import psycopg2
-import pandas as pd
-import numpy as np
 import json
+import math
 from datetime import datetime, timedelta
+
+import psycopg2
+from psycopg2 import errors as pg_errors
 from dotenv import load_dotenv
-from tqdm import tqdm
+
+# Third-party progress bar
+try:
+    from tqdm import tqdm
+except ImportError:
+    import sys
+    print("tqdm is required. Install with: pip install tqdm")
+    sys.exit(1)
+
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Configuration (can be overridden via environment; defaults match original)
+# ---------------------------------------------------------------------------
+LOOKBACK_DAYS = int(os.getenv("KHALTI_LOOKBACK_DAYS", 14))
+TIMEZONE = "Asia/Kathmandu"          # local cultural time
+OUTPUT_FILE = "khalti_dna.json"
+
+# ---------------------------------------------------------------------------
+# Database connection
+# ---------------------------------------------------------------------------
 def get_conn():
+    """Create a PostgreSQL connection from environment variables."""
     try:
         return psycopg2.connect(
             dbname=os.getenv("DB_NAME"),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
             host=os.getenv("DB_HOST"),
-            port=os.getenv("DB_PORT")
+            port=os.getenv("DB_PORT"),
         )
     except Exception as e:
-        print(f"\n[!] Database Connection Error: {e}")
-        exit(1)
+        print(f"\n[!] Database connection error: {e}")
+        raise SystemExit(1)
 
-# --- ANALYTICS PARAMETERS ---
-LOOKBACK_DAYS = 14        
-VELOCITY_THRESHOLD = 40  
-DEVICE_THRESHOLD = 2     
-BURST_THRESHOLD_SEC = 1800 
 
-def fetch_transaction_slice(conn):
-    """Fetches numeric/temporal data for heavy-tail and heuristic analysis."""
-    start = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d 00:00:00')
-    
-    query = f"""
-    SELECT 
-        issuee_id AS user_id,
-        acquiree_id AS merchant_id,
-        amount::float,
-        device_id,
-        created_on AT TIME ZONE 'Asia/Kathmandu' AS created_at
-    FROM qrapp_fonepaytransaction
-    WHERE created_on >= '{start}'
-    AND amount > 0;
+# ---------------------------------------------------------------------------
+# SQL‑only extraction helpers
+# ---------------------------------------------------------------------------
+def compute_total_transactions(conn, window_start: str) -> int:
+    """Count transactions in the window (merchant‑facing only)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM qrapp_fonepaytransaction
+            WHERE created_on >= %s AND amount > 0
+            """,
+            (window_start,),
+        )
+        return cur.fetchone()[0]
+
+
+def compute_temporal_heatmap(conn, window_start: str) -> list:
     """
-    df = pd.read_sql_query(query, conn)
-    if not df.empty:
-        df['created_at'] = pd.to_datetime(df['created_at'])
-    return df
+    Return a 24 (hours) × 7 (days, 0=Sunday) matrix of transaction volumes.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                EXTRACT(HOUR FROM created_on AT TIME ZONE %s)::int AS hour,
+                EXTRACT(DOW FROM created_on AT TIME ZONE %s)::int AS dow,
+                COUNT(*) AS volume
+            FROM qrapp_fonepaytransaction
+            WHERE created_on >= %s AND amount > 0
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+            """,
+            (TIMEZONE, TIMEZONE, window_start),
+        )
+        rows = cur.fetchall()
 
-def fetch_categorical_profiles(conn):
-    start = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d 00:00:00')
-    profiles = {}
-    
+    # Build 24×7 matrix (list of lists)
+    heatmap = [[0] * 7 for _ in range(24)]  # hour row, day column
+    for hour, dow, vol in rows:
+        heatmap[hour][dow] = vol
+    return heatmap
+
+
+def compute_categorical_weights(conn, window_start: str) -> dict:
+    """
+    Extract probability distributions for critical categorical columns.
+    Tables/columns targeted:
+      - qrapp_fonepaytransaction.status
+      - qrapp_fonepaytransaction.purpose
+      - disbursement_transaction.type
+      - remittance_remittance.remit_type
+      - auth_useractionlog.action
+    Only the top‑10 values (by volume) are kept per column.
+    """
     targets = [
         ("qrapp_fonepaytransaction", "status"),
         ("qrapp_fonepaytransaction", "purpose"),
         ("disbursement_transaction", "type"),
         ("remittance_remittance", "remit_type"),
-        ("auth_useractionlog", "action")
+        ("auth_useractionlog", "action"),
     ]
 
-    cursor = conn.cursor()
-    for table, col in targets:
-        try:
-            # We use a time bound if the table has created_on to keep it relevant
-            # auth_useractionlog has 'created_on', disbursement has 'created_on', etc.
-            query = f"""
-                SELECT {col}, COUNT(*) as volume 
-                FROM {table} 
-                WHERE created_on >= '{start}'
-                GROUP BY {col} 
-                ORDER BY volume DESC 
-                LIMIT 10;
-            """
-            cursor.execute(query)
-            results = cursor.fetchall()
-            
-            total = sum([row[1] for row in results]) if results else 1
-            profiles[f"{table}.{col}"] = {
-                str(row[0]): round((row[1] / total), 4) for row in results if row[0] is not None
-            }
-        except Exception as e:
-            conn.rollback() # Skip if table is empty or missing in this environment
-            profiles[f"{table}.{col}"] = {"error": "extraction_failed"}
-            
-    cursor.close()
+    profiles = {}
+    with conn.cursor() as cur:
+        for table, column in targets:
+            key = f"{table}.{column}"
+            try:
+                # If a table is missing, we simply record an error and continue
+                cur.execute(
+                    f"""
+                    SELECT {column}, COUNT(*) AS volume
+                    FROM {table}
+                    WHERE created_on >= %s
+                    GROUP BY {column}
+                    ORDER BY volume DESC
+                    LIMIT 10
+                    """,
+                    (window_start,),
+                )
+                results = cur.fetchall()
+                total = sum(row[1] for row in results) if results else 1
+                profiles[key] = {
+                    str(row[0]): round(row[1] / total, 6)
+                    for row in results if row[0] is not None
+                }
+            except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn, Exception):
+                # Rollback to clear any error state for this cursor
+                conn.rollback()
+                profiles[key] = {"error": "extraction_failed"}
     return profiles
 
-def generate_comprehensive_metrics(df):
-    """Calculates all 2.1, 2.2, and 2.3 metrics efficiently."""
-    metrics = {}
-    
-    df = df.sort_values(by=['user_id', 'created_at'])
-    amounts = df['amount']
 
-    # --- 2.1 Distribution Metrics ---
-    p95 = amounts.quantile(0.95)
-    tail = amounts[amounts >= p95]
-    alpha = 1.0 / np.log(tail / p95).mean() if not tail.empty and p95 > 0 else 0
+def compute_monetary_pareto(conn, window_start: str) -> dict:
+    """
+    Calculate Pareto α for transaction amounts above the 95th percentile.
+    MLE α = 1 + n / Σ ln(x_i / x_min)
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH threshold AS (
+                SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY amount) AS p95
+                FROM qrapp_fonepaytransaction
+                WHERE created_on >= %s AND amount > 0
+            ),
+            tail AS (
+                SELECT amount
+                FROM qrapp_fonepaytransaction, threshold
+                WHERE created_on >= %s AND amount >= threshold.p95 AND amount > 0
+            )
+            SELECT
+                MAX(threshold.p95) AS p95,
+                COUNT(*) AS tail_count,
+                SUM(LN(amount / threshold.p95)) AS sum_ln_ratio
+            FROM tail, threshold
+            """,
+            (window_start, window_start),
+        )
+        p95, tail_count, sum_ln_ratio = cur.fetchone()
 
-    metrics["distribution"] = {
-        "mean": float(amounts.mean()),
-        "variance": float(amounts.var()),
-        "skewness": float(amounts.skew()),
-        "kurtosis": float(amounts.kurt()),
-        "pareto_alpha_tail": float(alpha),
-        "percentile_bands": {f"p{int(q*100)}": float(amounts.quantile(q)) for q in np.arange(0.1, 1.0, 0.1)}
+    # Guard against degenerate cases
+    if tail_count and sum_ln_ratio and sum_ln_ratio > 0:
+        pareto_alpha = 1.0 + tail_count / sum_ln_ratio
+    else:
+        pareto_alpha = 0.0
+        sum_ln_ratio = 0.0
+
+    return {
+        "pareto_alpha": round(float(pareto_alpha), 6),
+        "tail_threshold": float(p95) if p95 is not None else 0.0,
+        "tail_count": int(tail_count),
+        "sum_log_ratio": float(sum_ln_ratio) if sum_ln_ratio else 0.0,
     }
 
-    # --- 2.2 Temporal Dynamics ---
-    df['hour'] = df['created_at'].dt.hour
-    df['day_of_week'] = df['created_at'].dt.dayofweek
-    df['inter_arrival_sec'] = df.groupby('user_id')['created_at'].diff().dt.total_seconds()
 
-    metrics["temporal_dynamics"] = {
-        "hour_of_day_dist": {str(k): float(v) for k, v in df['hour'].value_counts(normalize=True).items()},
-        "day_of_week_dist": {str(k): float(v) for k, v in df['day_of_week'].value_counts(normalize=True).items()},
-        "inter_arrival": {
-            "mean_sec": float(df['inter_arrival_sec'].mean()),
-            "median_sec": float(df['inter_arrival_sec'].median())
-        },
-        "session_clustering": {
-            "burst_behavior_pct": float((df['inter_arrival_sec'] < BURST_THRESHOLD_SEC).mean())
-        }
+def compute_user_degree_pareto(conn, window_start: str) -> dict:
+    """
+    Pareto α for user transaction frequency (degree distribution).
+    Uses the MLE for a discrete power law with x_min = 1:
+        α = 1 + n / Σ ln(k)
+    where k = number of transactions per user.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH user_counts AS (
+                SELECT COUNT(*) AS tx_count
+                FROM qrapp_fonepaytransaction
+                WHERE created_on >= %s AND amount > 0
+                GROUP BY user_id
+            )
+            SELECT
+                COUNT(*) AS n,
+                SUM(LN(tx_count)) AS sum_log
+            FROM user_counts
+            WHERE tx_count >= 1
+            """,
+            (window_start,),
+        )
+        n, sum_log = cur.fetchone()
+
+    if n and sum_log and sum_log > 0:
+        pareto_alpha = 1.0 + n / sum_log
+    else:
+        pareto_alpha = 0.0
+        sum_log = 0.0
+
+    return {
+        "user_degree_pareto_alpha": round(float(pareto_alpha), 6),
+        "num_users": int(n),
+        "sum_log_degree": float(sum_log) if sum_log else 0.0,
     }
 
-    # --- 2.3 Relational Structure (Graphs) ---
-    edges = df.groupby(['user_id', 'merchant_id']).size()
-    user_degree = df.groupby('user_id')['merchant_id'].nunique()
-    devices_per_user = df.groupby('user_id')['device_id'].nunique()
 
-    # Ensure covariance is strictly calculated on numeric data to prevent Pandas errors
-    cov_df = df[['amount', 'inter_arrival_sec']].dropna()
-    cov_matrix = cov_df.cov().to_dict()
-
-    metrics["relational_structure"] = {
-        "user_merchant_degree": {
-            "mean": float(user_degree.mean()),
-            "max": int(user_degree.max())
-        },
-        "edge_weight_distribution": {
-            "mean_tx_per_edge": float(edges.mean()),
-            "max_tx_per_edge": int(edges.max()),
-            "repeat_tx_frequency": float((edges > 1).mean())
-        },
-        "unique_devices_per_user": {
-            "mean": float(devices_per_user.mean()),
-            "max": int(devices_per_user.max())
-        },
-        "feature_covariance": {
-            k: {k2: float(v2) for k2, v2 in v.items()} for k, v in cov_matrix.items()
-        }
-    }
-
-    return metrics, df
-
-def detect_anomalies(df):
-    """Filters user profiles heuristically based on velocity and device counts."""
-    profiles = df.groupby('user_id').agg(
-        tx_count=('amount', 'count'),
-        unique_devices=('device_id', 'nunique')
-    )
-    
-    high_risk = profiles[
-        (profiles['tx_count'] > VELOCITY_THRESHOLD) | 
-        (profiles['unique_devices'] >= DEVICE_THRESHOLD)
-    ]
-    return high_risk.sort_values(by='tx_count', ascending=False)
-
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
 def main():
-    print("\nInitializing Sherlock-Alpha Scan Pipeline...")
-    
-    # Set up progress bar with 5 steps
-    with tqdm(total=5, desc="Overall Progress", bar_format="{l_bar}{bar:30}{r_bar}") as pbar:
-        
+    print("\n=== Khalti DNA Extractor ===")
+
+    # ── Progress bar setup ──
+    total_steps = 6
+    with tqdm(total=total_steps, desc="Extracting DNA", unit="step",
+              bar_format="{l_bar}{bar:30}{r_bar}") as pbar:
+
+        # 1. Connect & prepare window
+        pbar.set_postfix_str("Connecting to DB...")
         conn = get_conn()
-        pbar.set_postfix_str("Fetching temporal data slice...")
-        
-        # 1. Fetch raw numeric/temporal data
-        full_df = fetch_transaction_slice(conn)
-        pbar.update(1)
-        
-        if full_df.empty:
-            print("\n[!] No records found in the specified window.")
-            conn.close()
-            return
-            
-        pbar.set_postfix_str("Extracting categorical profiles (SQL)...")
-        
-        # 2. Extract categorical distributions efficiently via DB
-        categorical_metrics = fetch_categorical_profiles(conn)
+        window_start = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         pbar.update(1)
 
-        pbar.set_postfix_str("Computing structural metrics (Pandas)...")
-        
-        # 3. Compute continuous and relational metrics
-        sys_metrics, enriched_df = generate_comprehensive_metrics(full_df)
-        pbar.update(1)
-        
-        pbar.set_postfix_str("Scanning for anomalous behavior...")
-        
-        # 4. Detect Anomalies
-        anomalies = detect_anomalies(enriched_df)
+        # 2. Temporal heatmap
+        pbar.set_postfix_str("Building temporal heatmap...")
+        heatmap = compute_temporal_heatmap(conn, window_start)
         pbar.update(1)
 
-        pbar.set_postfix_str("Compiling final JSON report...")
-        
-        # 5. Compile and save JSON
+        # 3. Categorical weights
+        pbar.set_postfix_str("Weighting categoricals...")
+        categorical_weights = compute_categorical_weights(conn, window_start)
+        pbar.update(1)
+
+        # 4. Monetary fat‑tail
+        pbar.set_postfix_str("Calculating monetary Pareto α...")
+        monetary = compute_monetary_pareto(conn, window_start)
+        pbar.update(1)
+
+        # 5. Graph topology (user degree)
+        pbar.set_postfix_str("Capturing graph topology...")
+        topology = compute_user_degree_pareto(conn, window_start)
+        pbar.update(1)
+
+        # 6. Compile & write final JSON
+        pbar.set_postfix_str("Writing khalti_dna.json...")
+        total_tx = compute_total_transactions(conn, window_start)
         report = {
             "metadata": {
+                "extraction_timestamp": datetime.utcnow().isoformat() + "Z",
+                "database": "khalti_fintech",
                 "window_days": LOOKBACK_DAYS,
-                "total_records_analyzed": len(full_df),
-                "generated_at": datetime.now().isoformat()
+                "total_transactions": total_tx,
             },
-            "categorical_profiles": categorical_metrics,
-            "system_metrics": sys_metrics,
-            "anomalies": anomalies.to_dict(orient='index')
+            "temporal_heatmap": heatmap,
+            "categorical_weights": categorical_weights,
+            "monetary_distribution": monetary,
+            "graph_topology": topology,
         }
 
-        output_file = 'sherlock_metrics_producer.json'
-        with open(output_file, 'w') as f:
-            json.dump(report, f, indent=4)
-            
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(report, f, indent=2, default=str)  # default=str catches any non‑serializable
+
         conn.close()
         pbar.update(1)
         pbar.set_postfix_str("Complete!")
 
-    print(f"\n✓ Scan Complete. Report exported to: '{output_file}'")
-    print(f"✓ Identified {len(anomalies)} anomalous user profiles.\n")
+    print(f"\n✔ DNA extraction complete. Report saved to '{OUTPUT_FILE}'\n")
+
 
 if __name__ == "__main__":
     main()
