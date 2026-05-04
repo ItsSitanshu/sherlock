@@ -6,12 +6,8 @@ import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-print(os.getenv("HELLO"))
-
-# --- CONNECTION SETTINGS FROM ENV ---
 def get_conn():
     try:
         return psycopg2.connect(
@@ -22,114 +18,153 @@ def get_conn():
             port=os.getenv("DB_PORT")
         )
     except Exception as e:
-        print(f"Error connecting to database: {e}")
+        print(f"Database Connection Error: {e}")
         exit(1)
 
-# --- ANALYTICS PARAMETERS ---
+#  ANALYTICS PARAMETERS
 LOOKBACK_DAYS = 14        
-SAMPLE_PERCENT = 1.0     
 VELOCITY_THRESHOLD = 40  
-DEVICE_THRESHOLD = 3     
+DEVICE_THRESHOLD = 1     
+BURST_THRESHOLD_SEC = 1800 
 
-def fetch_daily_slice(conn, date_obj):
-    """Fetches a high-fidelity slice for heuristic analysis."""
-    start = date_obj.strftime('%Y-%m-%d 00:00:00')
-    end = (date_obj + timedelta(days=1)).strftime('%Y-%m-%d 00:00:00')
+def fetch_data(conn):
+    """Fetches a high-fidelity slice for heuristic analysis efficiently in one query."""
+    start = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d 00:00:00')
     
     query = f"""
     SELECT 
         issuee_id AS user_id,
         acquiree_id AS merchant_id,
-        amount,
+        amount::float,
         device_id,
         created_on AT TIME ZONE 'Asia/Kathmandu' AS created_at
     FROM qrapp_fonepaytransaction
-    WHERE created_on >= '{start}' AND created_on < '{end}'
+    WHERE created_on >= '{start}'
     AND amount > 0;
     """
-    return pd.read_sql_query(query, conn)
-
-def get_distribution_profile(conn):
-    """Calculates global distribution metrics using block-level sampling."""
-    query = f"""
-    SELECT 
-        ABS(transaction_effect)::float AS amount
-    FROM gateway_wallethistory TABLESAMPLE SYSTEM ({SAMPLE_PERCENT})
-    WHERE created_on > NOW() - INTERVAL '{LOOKBACK_DAYS} days';
-    """
     df = pd.read_sql_query(query, conn)
-    
-    if df.empty:
-        return {}
+    df['created_at'] = pd.to_datetime(df['created_at'])
+    return df
 
-    p = np.percentile(df['amount'], [50, 90, 95, 99, 10])
-    mu = df['amount'].mean()
-    sigma = df['amount'].std()
+def generate_comprehensive_metrics(df):
+    """Calculates all 2.1, 2.2, and 2.3 metrics"""
+    metrics = {}
     
-    tail = df['amount'][df['amount'] >= p[2]]
-    alpha = 1.0 / np.log(tail / p[2]).mean() if not tail.empty else 0
-    
-    return {
-        "mean": round(mu, 2),
-        "stddev": round(sigma, 2),
-        "p50": p[0], "p95": p[2], "p99": p[3], "p10": p[4],
-        "pareto_alpha": round(alpha, 4)
+    # Pre-sort for temporal and relational calcs
+    df = df.sort_values(by=['user_id', 'created_at'])
+    amounts = df['amount']
+
+    #  § 2.1 - Distribution Metrics
+    p95 = amounts.quantile(0.95)
+    tail = amounts[amounts >= p95]
+    alpha = 1.0 / np.log(tail / p95).mean() if not tail.empty and p95 > 0 else 0
+
+    metrics["distribution"] = {
+        "mean": float(amounts.mean()),
+        "variance": float(amounts.var()),
+        "skewness": float(amounts.skew()),
+        "kurtosis": float(amounts.kurt()),
+        "pareto_alpha_tail": float(alpha),
+        "percentile_bands": {
+            f"p{int(q*100)}": float(amounts.quantile(q)) 
+            for q in np.arange(0.1, 1.0, 0.1)
+        }
     }
+
+    #  § 2.2 - Temporal Dynamics
+    df['hour'] = df['created_at'].dt.hour
+    df['day_of_week'] = df['created_at'].dt.dayofweek
+    df['inter_arrival_sec'] = df.groupby('user_id')['created_at'].diff().dt.total_seconds()
+
+    metrics["temporal_dynamics"] = {
+        "hour_of_day_dist": {str(k): float(v) for k, v in df['hour'].value_counts(normalize=True).items()},
+        "day_of_week_dist": {str(k): float(v) for k, v in df['day_of_week'].value_counts(normalize=True).items()},
+        "inter_arrival": {
+            "mean_sec": float(df['inter_arrival_sec'].mean()),
+            "median_sec": float(df['inter_arrival_sec'].median())
+        },
+        "session_clustering": {
+            "burst_behavior_pct": float((df['inter_arrival_sec'] < BURST_THRESHOLD_SEC).mean())
+        }
+    }
+
+    #  § 2.3 - Relational Structure (Graphs)
+    edges = df.groupby(['user_id', 'merchant_id']).size()
+    user_degree = df.groupby('user_id')['merchant_id'].nunique()
+    devices_per_user = df.groupby('user_id')['device_id'].nunique()
+
+    cov_df = df[['amount', 'inter_arrival_sec']].dropna()
+    cov_matrix = cov_df.cov().to_dict()
+
+    metrics["relational_structure"] = {
+        "user_merchant_degree": {
+            "mean": float(user_degree.mean()),
+            "max": int(user_degree.max())
+        },
+        "edge_weight_distribution": {
+            "mean_tx_per_edge": float(edges.mean()),
+            "max_tx_per_edge": int(edges.max()),
+            "repeat_tx_frequency": float((edges > 1).mean())
+        },
+        "unique_devices_per_user": {
+            "mean": float(devices_per_user.mean()),
+            "max": int(devices_per_user.max())
+        },
+        "feature_covariance": {
+            k: {k2: float(v2) for k2, v2 in v.items()} 
+            for k, v in cov_matrix.items()
+        }
+    }
+
+    return metrics, df
+
+def detect_anomalies(df):
+    """Filters user profiles heuristically based on velocity and device counts."""
+    profiles = df.groupby('user_id').agg(
+        tx_count=('amount', 'count'),
+        unique_devices=('device_id', 'nunique')
+    )
+    
+    high_risk = profiles[
+        (profiles['tx_count'] > VELOCITY_THRESHOLD) | 
+        (profiles['unique_devices'] >= DEVICE_THRESHOLD)
+    ]
+    return high_risk.sort_values(by='tx_count', ascending=False)
 
 def main():
     print(f"[{datetime.now()}] Initializing Sherlock-Alpha Scan...")
     conn = get_conn()
-    all_slices = []
 
-    # 1. Temporal Data Collection
-    for i in range(1, LOOKBACK_DAYS + 1):
-        target_date = datetime.now() - timedelta(days=i)
-        print(f" -> Processing Slice: {target_date.date()}")
-        all_slices.append(fetch_daily_slice(conn, target_date))
+    print(" -> Fetching temporal slice...")
+    full_df = fetch_data(conn)
+    
+    if full_df.empty:
+        print("No records found in the specified window.")
+        conn.close()
+        return
 
-    full_df = pd.concat(all_slices, ignore_index=True)
+    print(" -> Computing structural metrics and heuristics...")
+    metrics_report, enriched_df = generate_comprehensive_metrics(full_df)
+    
+    print(" -> Identifying Anomalies...")
+    anomalies = detect_anomalies(enriched_df)
 
-    # 2. Heuristic Fraud Detection
-    print(" -> Computing behavioral heuristics...")
-    user_profiles = full_df.groupby('user_id').agg({
-        'amount': ['count', 'sum', 'mean', 'std'],
-        'device_id': 'nunique',
-        'merchant_id': 'nunique',
-        'created_at': lambda x: (x.max() - x.min()).total_seconds() / 3600
-    })
-
-    user_profiles.columns = [
-        'tx_count', 'total_volume', 'avg_amount', 'std_amount', 
-        'unique_devices', 'unique_merchants', 'activity_span_hrs'
-    ]
-
-    # 3. Identifying Anomalies
-    high_risk = user_profiles[
-        (user_profiles['tx_count'] > VELOCITY_THRESHOLD) | 
-        (user_profiles['unique_devices'] >= DEVICE_THRESHOLD)
-    ].copy()
-
-    # 4. Global Baseline
-    print(" -> Calculating global distribution baseline...")
-    baseline = get_distribution_profile(conn)
-
-    # 5. Final Report
     report = {
         "metadata": {
             "window_days": LOOKBACK_DAYS,
             "total_records_analyzed": len(full_df),
             "generated_at": datetime.now().isoformat()
         },
-        "baseline_metrics": baseline,
-        "anomalies": high_risk.sort_values(by='tx_count', ascending=False).to_dict(orient='index')
+        "system_metrics": metrics_report,
+        "anomalies": anomalies.to_dict(orient='index')
     }
 
-    output_file = 'sherlock_fraud_report.json'
+    output_file = 'sherlock_metrics_producer.json'
     with open(output_file, 'w') as f:
         json.dump(report, f, indent=4)
 
-    print(f"\nScan Complete. Report: '{output_file}'")
-    print(f"Identified {len(high_risk)} anomalous user profiles.")
+    print(f"\nScan Complete. Report exported to: '{output_file}'")
+    print(f"Identified {len(anomalies)} anomalous user profiles.")
     conn.close()
 
 if __name__ == "__main__":
