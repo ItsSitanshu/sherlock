@@ -1,6 +1,25 @@
 use std::collections::HashMap;
 
 // ─────────────────────────────────────────────
+// 2. Unified Mono-CSV Transaction Row
+// ─────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct TransactionRow {
+    pub user_id: String,
+    pub counterparty_id: String,
+    pub amount: f64,
+    pub timestamp: u64,
+    pub qr_status: String,
+    pub qr_purpose: String,
+    pub disb_type: String,
+    pub remit_type: String,
+    pub auth_action: String,
+    pub device_id: String,
+    pub is_burst: bool,
+}
+
+// ─────────────────────────────────────────────
 // 1. Entity / Node / Edge types
 // ─────────────────────────────────────────────
 
@@ -37,7 +56,7 @@ pub struct TransactionEdge {
 }
 
 // ─────────────────────────────────────────────
-// 2. CSV row representations (one per source)
+// 3. Legacy CSV row representations (deprecated)
 // ─────────────────────────────────────────────
 
 /// wallet_history rows

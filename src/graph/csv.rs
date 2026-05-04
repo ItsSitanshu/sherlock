@@ -141,3 +141,24 @@ pub fn parse_disbursements(path: &str) -> io::Result<Vec<DisbursementRow>> {
         })
     }).collect())
 }
+
+/// Parse unified mono-CSV format.
+/// Columns: user_id,counterparty_id,amount,timestamp,qr_status,qr_purpose,disb_type,remit_type,auth_action,device_id,is_burst
+pub fn parse_unified_transactions(path: &str) -> io::Result<Vec<TransactionRow>> {
+    Ok(read_csv_lines(path)?.into_iter().filter_map(|f| {
+        if f.len() < 11 { return None; }
+        Some(TransactionRow {
+            user_id: s(&f[0]),
+            counterparty_id: s(&f[1]),
+            amount: parse_f64(&f[2]),
+            timestamp: parse_u64(&f[3]),
+            qr_status: s(&f[4]),
+            qr_purpose: s(&f[5]),
+            disb_type: s(&f[6]),
+            remit_type: s(&f[7]),
+            auth_action: s(&f[8]),
+            device_id: s(&f[9]),
+            is_burst: parse_bool(&f[10]),
+        })
+    }).collect())
+}

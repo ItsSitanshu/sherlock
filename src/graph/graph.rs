@@ -145,4 +145,25 @@ impl SherlockGraph {
         pb.finish(t0.elapsed().as_millis());
         Ok(n)
     }
+
+    /// Load unified mono-CSV format.
+    /// Edge: user_id → counterparty_id, weight = amount
+    pub fn load_unified_transactions(&mut self, path: &str) -> io::Result<usize> {
+        let rows = parse_unified_transactions(path)?;
+        let n = rows.len();
+        let pb = ProgressBar::new("unified_transactions", n);
+        let t0 = Instant::now();
+        for (i, r) in rows.iter().enumerate() {
+            if r.user_id.is_empty() || r.counterparty_id.is_empty() { continue; }
+            self.add_transaction(
+                EntityType::Account(format!("USR:{}", r.user_id)),
+                EntityType::Account(format!("CP:{}", r.counterparty_id)),
+                r.amount,
+                r.timestamp,
+            );
+            if i % 500 == 0 { pb.update(i); }
+        }
+        pb.finish(t0.elapsed().as_millis());
+        Ok(n)
+    }
 }
