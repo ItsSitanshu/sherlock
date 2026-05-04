@@ -2,3 +2,5 @@
 *.json
 *.pkl
 *.csv
+
+venv/
