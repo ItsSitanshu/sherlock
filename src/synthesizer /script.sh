@@ -19,8 +19,8 @@ if [[ -z "$DSN" ]]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${SCRIPT_DIR}/../../data/stats"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts"
+OUT_DIR="${SCRIPT_DIR}/../../../data/stats"
 mkdir -p "$OUT_DIR"
 
 run_sql() {
