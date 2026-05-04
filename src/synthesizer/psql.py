@@ -26,7 +26,7 @@ def get_conn():
         exit(1)
 
 # --- ANALYTICS PARAMETERS ---
-LOOKBACK_DAYS = 7        
+LOOKBACK_DAYS = 14        
 SAMPLE_PERCENT = 1.0     
 VELOCITY_THRESHOLD = 40  
 DEVICE_THRESHOLD = 3     
