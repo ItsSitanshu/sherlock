@@ -1,1 +1,0 @@
-- [Sitanshu Shrestha](https://sitanshu-shrestha.vercel.app)
