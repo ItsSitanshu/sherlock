@@ -29,7 +29,17 @@ OUTPUT_FILE = "khalti_dna.json"
 
 USE_SAMPLING = os.getenv("USE_SAMPLING", "true").lower() == "true"
 SAMPLE_RATIO = float(os.getenv("SAMPLE_RATIO", "0.0001"))
-MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "1000000"))  
+MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "1000000"))
+
+# TABLESAMPLE SYSTEM percent for the heatmap. ~461M rows total, 14-day window
+# is ~1% of table (~4.8M rows). 1.0% sample → ~48k window rows / ~286 per
+# (hour,dow) cell — MoE ~7% at 95% CI, plenty for a heatmap visualization.
+HEATMAP_SAMPLE_PCT = float(os.getenv("HEATMAP_SAMPLE_PCT", "1.0"))
+
+# TABLESAMPLE SYSTEM percent for monetary Pareto + graph topology. 0.5%
+# gives ~24k window rows for monetary p95 (rock-stable estimate) and
+# ~10k distinct source_ids for graph alpha. Each query ≈ 50s.
+WINDOW_SAMPLE_PCT = float(os.getenv("WINDOW_SAMPLE_PCT", "0.5"))
 
 BATCH_SIZE = 100000  
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "4"))
@@ -56,7 +66,7 @@ class ReadOnlyConnection:
 def get_sample_size(conn, table: str, window_start: str) -> int:
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT COUNT(*) FROM qrapp_fonepaytransaction 
+            SELECT COUNT(*) FROM gateway_transaction 
             WHERE created_on >= %s AND amount > 0
         """, (window_start,))
         total = cur.fetchone()[0]
@@ -75,13 +85,13 @@ def compute_total_transactions_sampled(conn, window_start: str) -> dict:
                 reltuples::bigint AS approx_count,
                 n_live_tup AS live_tuples
             FROM pg_class 
-            WHERE relname = 'qrapp_fonepaytransaction'
+            WHERE relname = 'gateway_transaction'
         """)
         approx = cur.fetchone()
         
         cur.execute("""
             EXPLAIN (FORMAT JSON) 
-            SELECT COUNT(*) FROM qrapp_fonepaytransaction 
+            SELECT COUNT(*) FROM gateway_transaction 
             WHERE created_on >= %s AND amount > 0
         """, (window_start,))
         explain = cur.fetchone()[0]
@@ -94,31 +104,33 @@ def compute_total_transactions_sampled(conn, window_start: str) -> dict:
 
 # ---------------------------------------------------------------------------
 def compute_temporal_heatmap_streaming(conn, window_start: str) -> list:
+    partition_clause = sql.SQL("AND created_on > NOW() - INTERVAL '30 days'") \
+        if LOOKBACK_DAYS <= 30 else sql.SQL("")
+    sample_clause = sql.SQL("TABLESAMPLE SYSTEM({pct})").format(
+        pct=sql.Literal(HEATMAP_SAMPLE_PCT)
+    ) if USE_SAMPLING else sql.SQL("")
+
+    query = sql.SQL("""
+        SELECT
+            EXTRACT(HOUR FROM created_on AT TIME ZONE %s)::int AS hour,
+            EXTRACT(DOW  FROM created_on AT TIME ZONE %s)::int AS dow,
+            COUNT(*) AS volume
+        FROM gateway_transaction {sample_clause}
+        WHERE created_on >= %s AND amount > 0
+            {partition_clause}
+        GROUP BY hour, dow
+        HAVING COUNT(*) > 0
+        ORDER BY hour, dow
+    """).format(sample_clause=sample_clause, partition_clause=partition_clause)
+
     with conn.cursor() as cur:
-        cur.execute("""
-            WITH hourly_volume AS (
-                SELECT 
-                    EXTRACT(HOUR FROM created_on AT TIME ZONE %s)::int AS hour,
-                    EXTRACT(DOW FROM created_on AT TIME ZONE %s)::int AS dow,
-                    COUNT(*) AS volume
-                FROM qrapp_fonepaytransaction
-                WHERE created_on >= %s AND amount > 0
-                    AND created_on %s  -- Partition on recent data if partitioned
-                GROUP BY GROUPING SETS ((hour, dow), ())
-                HAVING COUNT(*) > 0
-            )
-            SELECT 
-                hour, dow, volume,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY volume) OVER () AS p95_volume
-            FROM hourly_volume
-            ORDER BY hour, dow
-        """, (TIMEZONE, TIMEZONE, window_start, 
-              "AND created_on > NOW() - INTERVAL '30 days'" if LOOKBACK_DAYS <= 30 else ""))
-        
+        cur.execute(query, (TIMEZONE, TIMEZONE, window_start))
         rows = cur.fetchall()
-    
+
     heatmap = [[0] * 7 for _ in range(24)]
-    for hour, dow, vol, _ in rows:
+    for hour, dow, vol in rows:
+        if hour is None or dow is None:
+            continue
         heatmap[hour][dow] = vol
     
     return {
@@ -130,10 +142,8 @@ def compute_temporal_heatmap_streaming(conn, window_start: str) -> list:
 def compute_categorical_weights_stratified(conn, window_start: str) -> dict:
     """Use stratified sampling for categorical columns."""
     tables_config = [
-        ("qrapp_fonepaytransaction", "status", "status IN ('success', 'failed', 'pending')"),
-        ("qrapp_fonepaytransaction", "purpose", "purpose IS NOT NULL"),
-        ("disbursement_transaction", "type", "type IS NOT NULL"),
-        ("remittance_remittance", "remit_type", "remit_type IS NOT NULL"),
+        ("gateway_transaction", "is_obsolete", "is_obsolete IS NOT NULL"),
+        ("gateway_transaction", "purpose", "purpose IS NOT NULL"),
     ]
     
     profiles = {}
@@ -194,52 +204,59 @@ def compute_categorical_weights_stratified(conn, window_start: str) -> dict:
 
 def compute_monetary_pareto_reservoir(conn, window_start: str) -> dict:
     reservoir_size = 1000000  # 1M samples for tail
-    
+
+    sample = sql.SQL("TABLESAMPLE SYSTEM({pct})").format(pct=sql.Literal(WINDOW_SAMPLE_PCT)) \
+        if USE_SAMPLING else sql.SQL("")
+
     with conn.cursor() as cur:
-        cur.execute("""
+        q1 = sql.SQL("""
             WITH threshold AS (
-                SELECT 
+                SELECT
                     percentile_cont(0.95) WITHIN GROUP (ORDER BY amount) AS p95
-                FROM qrapp_fonepaytransaction
+                FROM gateway_transaction {sample}
                 WHERE created_on >= %s AND amount > 0
             )
-            SELECT 
+            SELECT
                 p95,
                 (
                     SELECT COUNT(*)
-                    FROM qrapp_fonepaytransaction, threshold
-                    WHERE created_on >= %s 
-                        AND amount >= threshold.p95 
+                    FROM gateway_transaction {sample}, threshold
+                    WHERE created_on >= %s
+                        AND amount >= threshold.p95
                         AND amount > 0
                 ) AS tail_count_approx
             FROM threshold
-        """, (window_start, window_start))
-        
+        """).format(sample=sample)
+        cur.execute(q1, (window_start, window_start))
+
         p95, approx_tail_count = cur.fetchone()
-        
-        cur.execute("""
+
+        q2 = sql.SQL("""
             WITH RECURSIVE reservoir AS (
-                SELECT 
+                SELECT
                     amount,
                     random() AS r
-                FROM qrapp_fonepaytransaction
-                WHERE created_on >= %s 
-                    AND amount >= %s 
+                FROM gateway_transaction {sample}
+                WHERE created_on >= %s
+                    AND amount >= %s
                     AND amount > 0
                 ORDER BY r
                 LIMIT %s
             )
-            SELECT 
+            SELECT
                 COUNT(*) AS n,
                 SUM(LN(amount / %s)) AS sum_ln_ratio,
                 MIN(amount) AS min_tail,
                 MAX(amount) AS max_tail,
                 AVG(amount) AS mean_tail
             FROM reservoir
-        """, (window_start, p95, reservoir_size, p95))
+        """).format(sample=sample)
+        cur.execute(q2, (window_start, p95, reservoir_size, p95))
         
         n, sum_ln_ratio, min_tail, max_tail, mean_tail = cur.fetchone()
-        
+        n = int(n) if n is not None else 0
+        sum_ln_ratio = float(sum_ln_ratio) if sum_ln_ratio is not None else 0.0
+
         if n and sum_ln_ratio and sum_ln_ratio > 0:
             pareto_alpha = 1.0 + n / sum_ln_ratio
             # Bootstrap confidence interval
@@ -265,46 +282,49 @@ def compute_monetary_pareto_reservoir(conn, window_start: str) -> dict:
     }
 
 def compute_user_degree_hyperloglog(conn, window_start: str) -> dict:
+    sample = sql.SQL("TABLESAMPLE SYSTEM({pct})").format(pct=sql.Literal(WINDOW_SAMPLE_PCT)) \
+        if USE_SAMPLING else sql.SQL("")
+
     with conn.cursor() as cur:
         cur.execute("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hll')")
         has_hll = cur.fetchone()[0]
-        
+
         if has_hll and USE_SAMPLING:
-            cur.execute("""
-                SELECT 
-                    hll_cardinality(hll_union_agg(hll_hash_integer(user_id))) AS approx_distinct_users,
+            q = sql.SQL("""
+                SELECT
+                    hll_cardinality(hll_union_agg(hll_hash_integer(source_id))) AS approx_distinct_users,
                     COUNT(*) AS total_transactions,
                     AVG(tx_count) AS avg_degree,
                     STDDEV(tx_count) AS std_degree
                 FROM (
-                    SELECT 
-                        user_id,
+                    SELECT
+                        source_id,
                         COUNT(*) AS tx_count
-                    FROM qrapp_fonepaytransaction
+                    FROM gateway_transaction {sample}
                     WHERE created_on >= %s AND amount > 0
-                    GROUP BY user_id
+                    GROUP BY source_id
                     LIMIT %s
                 ) AS user_tx
-            """, (window_start, MIN_SAMPLE_SIZE))
+            """).format(sample=sample)
+            cur.execute(q, (window_start, MIN_SAMPLE_SIZE))
         else:
-            cur.execute("""
+            q = sql.SQL("""
                 WITH sampled_users AS (
-                    SELECT 
-                        user_id,
-                        COUNT(*) AS tx_count,
-                        row_number() OVER (ORDER BY user_id) * random() AS sample_key
-                    FROM qrapp_fonepaytransaction
+                    SELECT
+                        source_id,
+                        COUNT(*) AS tx_count
+                    FROM gateway_transaction {sample}
                     WHERE created_on >= %s AND amount > 0
-                    GROUP BY user_id
-                    HAVING random() < %s
+                    GROUP BY source_id
                 )
-                SELECT 
+                SELECT
                     COUNT(*) AS sampled_users,
                     SUM(tx_count) AS total_tx,
                     SUM(LN(tx_count)) AS sum_log,
                     PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tx_count) AS median_degree
                 FROM sampled_users
-            """, (window_start, SAMPLE_RATIO))
+            """).format(sample=sample)
+            cur.execute(q, (window_start,))
         
         row = cur.fetchone()
         
