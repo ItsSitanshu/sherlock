@@ -1,4 +1,6 @@
 venv/
 .env
 __pycache__/
-khalti_dna.json
+data/
+lib/
+*json
